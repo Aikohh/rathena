@@ -9,6 +9,9 @@
 #include <string>
 #include <unordered_map>
 
+#include <termios.h>
+#include <unistd.h>
+
 #include "passwdcrypt.hpp"
 
 
@@ -225,7 +228,7 @@ static TIMER_FUNC(login_online_data_cleanup){
  *	1: incorrect pass or userid (userid|pass too short or already exist);
  *	3: registration limit exceeded;
  */
-int32 login_mmo_auth_new(const char* userid, const char* pass, const char sex, const char* last_ip) {
+int32 login_mmo_auth_new(const char* userid, const char* pass, const char sex, const char* last_ip, bool peppered) {
 	static int32 num_regs = 0; // registration counter
 	static t_tick new_reg_tick = 0;
 	t_tick tick = gettick();
@@ -256,6 +259,16 @@ int32 login_mmo_auth_new(const char* userid, const char* pass, const char sex, c
 	acc.account_id = -1; // assigned by account db
 	safestrncpy(acc.userid, userid, sizeof(acc.userid));
 
+	// A <passwordencrypt> client sends MD5(key + password). That is only a
+	// stable credential when the key is the fixed pepper; with the default
+	// random nonce it differs every session, so hashing it would create an
+	// account that can never log in again.
+	if( peppered && login_config.password_pepper[0] == '\0' ){
+		ShowError("login_mmo_auth_new: refusing to create '%s' from a <passwordencrypt> client while password_pepper is empty.\n", userid);
+		ShowError("login_mmo_auth_new: the per-session nonce would make the stored password unusable.\n");
+		return 3; // 3 = Rejected from server
+	}
+
 	// passwd_hash reports failure by returning an empty string; it never
 	// throws, so a failed hash cannot take the login-server down
 	std::string hashed = passwd_hash( pass );
@@ -276,7 +289,7 @@ int32 login_mmo_auth_new(const char* userid, const char* pass, const char sex, c
 	safestrncpy(acc.pincode, "", sizeof(acc.pincode));
 	acc.pincode_change = 0;
 	acc.char_slots = MIN_CHARS;
-	acc.passwd_type = PASSWD_TYPE_ARGON2;
+	acc.passwd_type = peppered ? PASSWD_TYPE_ARGON2_PEPPER : PASSWD_TYPE_ARGON2;
 #ifdef VIP_ENABLE
 	acc.vip_time = 0;
 	acc.old_group = 0;
@@ -341,8 +354,10 @@ int32 login_mmo_auth(struct login_session_data* sd, bool isServer) {
 		if( len > 2 && strnlen(sd->passwd, NAME_LENGTH) > 0 && // valid user and password lengths
 			sd->userid[len-2] == '_' && memchr("FfMm", sd->userid[len-1], 4) ) // _M/_F suffix
 		{
-			// Encoded password
-			if( sd->passwdenc != 0 ){
+			// Encoded password. With the fixed pepper the digest is stable and
+			// can be stored; with the default random nonce it is not, so
+			// registration from such a client still has to be refused.
+			if( sd->passwdenc != 0 && login_config.password_pepper[0] == '\0' ){
 				ShowError( "Account '%s' could not be created because client side password encryption is enabled.\n", sd->userid );
 				return 0; // unregistered id
 			}
@@ -352,7 +367,7 @@ int32 login_mmo_auth(struct login_session_data* sd, bool isServer) {
 			len -= 2;
 			sd->userid[len] = '\0';
 
-			result = login_mmo_auth_new(sd->userid, sd->passwd, TOUPPER(sd->userid[len+1]), ip);
+			result = login_mmo_auth_new(sd->userid, sd->passwd, TOUPPER(sd->userid[len+1]), ip, sd->passwdenc != 0);
 			if( result != -1 )
 				return result;// Failed to make account. [Skotlex].
 		}
@@ -468,6 +483,29 @@ int32 login_mmo_auth(struct login_session_data* sd, bool isServer) {
  * @return true if matching else false
  */
 bool login_check_password( struct login_session_data& sd, struct mmo_account& acc ){
+	// Peppered accounts: the client already hashed the password with the fixed
+	// key, so sd.passwd IS the credential. It is deterministic, which is what
+	// makes argon2id possible here - and also what makes it replayable.
+	if( acc.passwd_type == PASSWD_TYPE_ARGON2_PEPPER ){
+		if( login_config.password_pepper[0] == '\0' ){
+			ShowError( "Account '%s' is peppered but password_pepper is not configured; refusing the login.\n", acc.userid );
+			return false;
+		}
+
+		if( sd.passwdenc == 0 ){
+			ShowError( "Account '%s' is peppered but the client sent a cleartext password.\n", acc.userid );
+			ShowError( "The client must use <passwordencrypt>. Reset it with: ./login-server --set-password %s\n", acc.userid );
+			return false;
+		}
+
+		if( !passwd_is_argon2( acc.pass ) ){
+			ShowError( "Account '%s' has passwd_type=%u but `user_pass` is not an argon2id hash; refusing the login.\n", acc.userid, acc.passwd_type );
+			return false;
+		}
+
+		return passwd_verify( sd.passwd, acc.pass );
+	}
+
 	// Stored form is argon2id: <passwordencrypt> cannot work against it, because
 	// verifying the challenge would require the cleartext password.
 	if( acc.passwd_type == PASSWD_TYPE_ARGON2 ){
@@ -567,7 +605,7 @@ bool login_check_password( struct login_session_data& sd, struct mmo_account& ac
  * @return 1 if updated, 0 if already current, -1 on error
  */
 int32 login_update_password( const char* passwd, struct mmo_account* acc ){
-	if( acc->passwd_type == PASSWD_TYPE_ARGON2 ){
+	if( acc->passwd_type == PASSWD_TYPE_ARGON2 || acc->passwd_type == PASSWD_TYPE_ARGON2_PEPPER ){
 		return 0; // already current
 	}
 
@@ -594,6 +632,122 @@ int32 login_update_password( const char* passwd, struct mmo_account* acc ){
 	ShowInfo( "Encrypted password for %s\n", acc->userid );
 
 	return 1;
+}
+
+/**
+ * Read a password from stdin without echoing it.
+ * @return false if nothing could be read
+ */
+static bool login_read_password( const char* prompt, char* out, size_t out_size ){
+	bool interactive = isatty( STDIN_FILENO ) != 0;
+	struct termios old_term, new_term;
+
+	if( interactive ){
+		ShowMessage( "%s", prompt );
+
+		if( tcgetattr( STDIN_FILENO, &old_term ) == 0 ){
+			new_term = old_term;
+			new_term.c_lflag &= ~ECHO;
+			tcsetattr( STDIN_FILENO, TCSAFLUSH, &new_term );
+		}else{
+			interactive = false;
+		}
+	}
+
+	bool ok = fgets( out, (int32)out_size, stdin ) != nullptr;
+
+	if( interactive ){
+		tcsetattr( STDIN_FILENO, TCSAFLUSH, &old_term );
+		ShowMessage( "\n" );
+	}
+
+	if( !ok ){
+		return false;
+	}
+
+	// strip the trailing newline
+	size_t len = strlen( out );
+
+	while( len > 0 && ( out[len - 1] == '\n' || out[len - 1] == '\r' ) ){
+		out[--len] = '\0';
+	}
+
+	return true;
+}
+
+/**
+ * Set one account's password, then shut down. Triggered by --set-password.
+ *
+ * Writes the final argon2id hash directly, so unlike an SQL UPDATE there is
+ * no window where the cleartext sits in the row waiting to be rehashed.
+ */
+static void login_set_password( const char* userid ){
+	struct mmo_account acc;
+
+	if( !accounts->load_str( accounts, &acc, userid ) ){
+		ShowError( "No such account: '%s'\n", userid );
+		global_core->signal_shutdown();
+		return;
+	}
+
+	char first[PASSWD_LENGTH];
+
+	if( !login_read_password( "New password: ", first, sizeof( first ) ) || first[0] == '\0' ){
+		ShowError( "No password given.\n" );
+		global_core->signal_shutdown();
+		return;
+	}
+
+	if( isatty( STDIN_FILENO ) ){
+		char again[PASSWD_LENGTH];
+
+		if( !login_read_password( "Repeat: ", again, sizeof( again ) ) || strcmp( first, again ) != 0 ){
+			ShowError( "Passwords do not match.\n" );
+			global_core->signal_shutdown();
+			return;
+		}
+	}
+
+	if( strlen( first ) < login_config.password_min_length ){
+		ShowError( "Password is shorter than password_min_length (%d).\n", login_config.password_min_length );
+		global_core->signal_shutdown();
+		return;
+	}
+
+	// In pepper mode the client sends MD5(pepper + password), so that is what
+	// has to be stored - hashing the raw password would never match.
+	const char* to_hash = first;
+	char peppered[32 + 1];
+	bool use_pepper = login_config.password_pepper[0] != '\0';
+
+	if( use_pepper ){
+		std::string combined = login_config.password_pepper;
+
+		combined.append( first );
+		MD5_String( combined.c_str(), peppered );
+		to_hash = peppered;
+	}
+
+	std::string hashed = passwd_hash( to_hash );
+
+	if( hashed.empty() ){
+		ShowError( "Could not hash the password.\n" );
+		global_core->signal_shutdown();
+		return;
+	}
+
+	safestrncpy( acc.pass, hashed.c_str(), sizeof( acc.pass ) );
+	acc.passwd_type = use_pepper ? PASSWD_TYPE_ARGON2_PEPPER : PASSWD_TYPE_ARGON2;
+
+	if( !accounts->save( accounts, &acc, false ) ){
+		ShowError( "Failed to save the account.\n" );
+		global_core->signal_shutdown();
+		return;
+	}
+
+	ShowStatus( "Password updated for '%s' (argon2id%s).\n", acc.userid, use_pepper ? ", peppered" : "" );
+
+	global_core->signal_shutdown();
 }
 
 /**
@@ -795,6 +949,8 @@ bool login_config_read(const char* cfgName, bool normal) {
 			login_config.start_limited_time = atoi(w2);
 		else if(!strcmpi(w1, "use_MD5_passwords"))
 			login_config.use_md5_passwds = (bool)config_switch(w2);
+		else if(!strcmpi(w1, "password_pepper"))
+			safestrncpy(login_config.password_pepper, w2, sizeof(login_config.password_pepper));
 		else if(!strcmpi(w1, "group_id_to_connect"))
 			login_config.group_id_to_connect = atoi(w2);
 		else if(!strcmpi(w1, "min_group_id_to_connect"))
@@ -915,6 +1071,7 @@ void login_set_defaults() {
 	login_config.password_min_length = 4;
 #endif
 	login_config.use_md5_passwds = false;
+	login_config.password_pepper[0] = '\0';
 	login_config.group_id_to_connect = -1;
 	login_config.min_group_id_to_connect = -1;
 
@@ -1015,11 +1172,25 @@ bool LoginServer::initialize( int32 argc, char* argv[] ){
 	// Handled here rather than in common/cli.cpp so that char-server and
 	// map-server do not need to link login-only symbols.
 	bool encrypt_all_passwords = false;
+	const char* set_password_for = nullptr;
 
 	for( int32 i = 1; i < argc; i++ ){
-		if( argv[i] != nullptr && strcmp( argv[i], "--encrypt-passwords" ) == 0 ){
+		if( argv[i] == nullptr ){
+			continue;
+		}
+
+		if( strcmp( argv[i], "--encrypt-passwords" ) == 0 ){
 			argv[i] = nullptr; // hide it from cli_get_options
 			encrypt_all_passwords = true;
+		}else if( strcmp( argv[i], "--set-password" ) == 0 ){
+			if( i + 1 >= argc || argv[i + 1] == nullptr ){
+				ShowFatalError( "--set-password requires an account name.\n" );
+				return false;
+			}
+
+			set_password_for = argv[i + 1];
+			argv[i] = nullptr;
+			argv[i + 1] = nullptr;
 		}
 	}
 
@@ -1060,9 +1231,16 @@ bool LoginServer::initialize( int32 argc, char* argv[] ){
 		}
 	}
 
+	// Both of these finish by requesting shutdown, so the listening port is
+	// never opened and they can run alongside a live login-server.
 	if( encrypt_all_passwords ){
 		login_update_all_passwords();
-		return true; // signal_shutdown() was requested; do not open the port
+		return true;
+	}
+
+	if( set_password_for != nullptr ){
+		login_set_password( set_password_for );
+		return true;
 	}
 
 	// server port open & binding

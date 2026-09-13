@@ -81,7 +81,7 @@ int32 cnslif_parse(const char* buf){
 				MD5_String(password,md5password);
 				md5 = 1;
 			}
-			if( login_mmo_auth_new(username,(md5?md5password:password), TOUPPER(sex), "0.0.0.0") != -1 ){
+			if( login_mmo_auth_new(username,(md5?md5password:password), TOUPPER(sex), "0.0.0.0", false) != -1 ){
 				ShowError("Console: Account creation failed.\n");
 				return 0;
 			}

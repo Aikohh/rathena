@@ -378,8 +378,17 @@ static void logclif_reqkey_result( int32 fd, struct login_session_data& sd ){
 static bool logclif_parse_reqkey( int32 fd, struct login_session_data& sd ){
 	PACKET_CA_REQ_HASH* p_in = (PACKET_CA_REQ_HASH*)RFIFOP( fd, 0 );
 
-	sd.md5keylen = sizeof( sd.md5key );
-	MD5_Salt( sd.md5keylen, sd.md5key );
+	if( login_config.password_pepper[0] != '\0' ){
+		// Pepper mode: answer with a CONSTANT instead of a per-session nonce, so
+		// MD5(key + password) is deterministic and can be fed to argon2id.
+		// The password no longer crosses the wire, but the digest becomes a
+		// permanently replayable credential - see conf/login_athena.conf.
+		sd.md5keylen = (uint16)strnlen( login_config.password_pepper, sizeof( sd.md5key ) );
+		memcpy( sd.md5key, login_config.password_pepper, sd.md5keylen );
+	}else{
+		sd.md5keylen = sizeof( sd.md5key );
+		MD5_Salt( sd.md5keylen, sd.md5key );
+	}
 
 	logclif_reqkey_result( fd, sd );
 

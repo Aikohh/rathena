@@ -20,6 +20,7 @@ enum e_passwd_type : uint8 {
 	PASSWD_TYPE_LEGACY = 0,       ///< plaintext, or a 32-char MD5 hash
 	PASSWD_TYPE_ARGON2 = 1,       ///< argon2id( password )
 	PASSWD_TYPE_ARGON2_MD5 = 2,   ///< argon2id( MD5( password ) ), migrated MD5 rows
+	PASSWD_TYPE_ARGON2_PEPPER = 3,///< argon2id( MD5( pepper + password ) ), see password_pepper
 };
 
 struct mmo_account {
