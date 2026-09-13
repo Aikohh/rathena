@@ -15,10 +15,17 @@ typedef struct AccountDBIterator AccountDBIterator;
 // standard engines
 AccountDB* account_db_sql(void);
 
+/// How `login`.`user_pass` is stored for an account.
+enum e_passwd_type : uint8 {
+	PASSWD_TYPE_LEGACY = 0,       ///< plaintext, or a 32-char MD5 hash
+	PASSWD_TYPE_ARGON2 = 1,       ///< argon2id( password )
+	PASSWD_TYPE_ARGON2_MD5 = 2,   ///< argon2id( MD5( password ) ), migrated MD5 rows
+};
+
 struct mmo_account {
 	uint32 account_id;
 	char userid[NAME_LENGTH];
-	char pass[32+1];        // 23+1 for plaintext, 32+1 for md5-ed passwords
+	char pass[98+1];        // 23+1 plaintext, 32+1 md5, 98+1 argon2id (PASSWD_ARGON2_ENCODED)
 	char sex;               // gender (M/F/S)
 	char email[40];         // e-mail (by default: a@a.com)
 	uint32 group_id;        // player group id
@@ -33,6 +40,7 @@ struct mmo_account {
 	char pincode[PINCODE_LENGTH+1];		// pincode system
 	time_t pincode_change;	// (timestamp): last time of pincode change
 	char web_auth_token[WEB_AUTH_TOKEN_LENGTH]; // web authentication token (randomized on each login)
+	uint8 passwd_type; // see e_passwd_type
 #ifdef VIP_ENABLE
 	int32 old_group;
 	time_t vip_time;

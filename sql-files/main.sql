@@ -770,7 +770,7 @@ CREATE TABLE IF NOT EXISTS `ipbanlist` (
 CREATE TABLE IF NOT EXISTS `login` (
   `account_id` int(11) unsigned NOT NULL auto_increment,
   `userid` varchar(23) NOT NULL default '',
-  `user_pass` varchar(32) NOT NULL default '',
+  `user_pass` varchar(98) NOT NULL default '', -- 32 plaintext/MD5, 98 argon2id
   `sex` enum('M','F','S') NOT NULL default 'M',
   `email` varchar(39) NOT NULL default '',
   `group_id` tinyint(3) NOT NULL default '0',
@@ -788,6 +788,7 @@ CREATE TABLE IF NOT EXISTS `login` (
   `old_group` tinyint(3) NOT NULL default '0',
   `web_auth_token` varchar(17) null,
   `web_auth_token_enabled` tinyint(2) NOT NULL default '0',
+  `passwd_type` tinyint unsigned NOT NULL default 0,
   PRIMARY KEY  (`account_id`),
   KEY `name` (`userid`),
   UNIQUE KEY `web_auth_token_key` (`web_auth_token`)

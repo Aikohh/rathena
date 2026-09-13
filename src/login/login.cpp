@@ -9,6 +9,9 @@
 #include <string>
 #include <unordered_map>
 
+#include "passwdcrypt.hpp"
+
+
 #include <common/cli.hpp>
 #include <common/core.hpp>
 #include <common/malloc.hpp>
@@ -17,7 +20,7 @@
 #include <common/msg_conf.hpp>
 #include <common/random.hpp>
 #include <common/showmsg.hpp>
-#include <common/socket.hpp> //ip2str
+#include <common/socket.hpp>  //ip2str
 #include <common/strlib.hpp>
 #include <common/timer.hpp>
 #include <common/utilities.hpp>
@@ -57,6 +60,7 @@ int32 login_fd; // login server file descriptor socket
 
 //early declaration
 bool login_check_password( struct login_session_data& sd, struct mmo_account& acc );
+int32 login_update_password( const char* passwd, struct mmo_account* acc );
 
 ///Accessors
 AccountDB* login_get_accounts_db(void){
@@ -251,7 +255,18 @@ int32 login_mmo_auth_new(const char* userid, const char* pass, const char sex, c
 	memset(&acc, '\0', sizeof(acc));
 	acc.account_id = -1; // assigned by account db
 	safestrncpy(acc.userid, userid, sizeof(acc.userid));
-	safestrncpy(acc.pass, pass, sizeof(acc.pass));
+
+	// passwd_hash reports failure by returning an empty string; it never
+	// throws, so a failed hash cannot take the login-server down
+	std::string hashed = passwd_hash( pass );
+
+	if( hashed.empty() ){
+		ShowError("login_mmo_auth_new: could not hash the password for account '%s'.\n", userid);
+		return 3; // 3 = Rejected from server
+	}
+
+	safestrncpy(acc.pass, hashed.c_str(), sizeof(acc.pass));
+
 	acc.sex = sex;
 	safestrncpy(acc.email, "a@a.com", sizeof(acc.email));
 	acc.expiration_time = ( login_config.start_limited_time != -1 ) ? time(nullptr) + login_config.start_limited_time : 0;
@@ -261,6 +276,7 @@ int32 login_mmo_auth_new(const char* userid, const char* pass, const char sex, c
 	safestrncpy(acc.pincode, "", sizeof(acc.pincode));
 	acc.pincode_change = 0;
 	acc.char_slots = MIN_CHARS;
+	acc.passwd_type = PASSWD_TYPE_ARGON2;
 #ifdef VIP_ENABLE
 	acc.vip_time = 0;
 	acc.old_group = 0;
@@ -357,6 +373,15 @@ int32 login_mmo_auth(struct login_session_data* sd, bool isServer) {
 		return 1; // 1 = Incorrect Password
 	}
 
+	// Password verified: migrate the stored form to argon2id if it is not already.
+	//
+	// Only possible when the client sent the password in the clear. Under
+	// <passwordencrypt> sd->passwd holds MD5(nonce + password), a value that
+	// changes every session - hashing it would lock the account out forever.
+	if( sd->passwdenc == 0 && login_update_password( sd->passwd, &acc ) < 0 ){
+		ShowNotice( "Failed to run argon2id, see above error for details\n" );
+	}
+
 	if( acc.expiration_time != 0 && acc.expiration_time < time(nullptr) ) {
 		ShowNotice("Connection refused (account: %s, expired ID, ip: %s)\n", sd->userid, ip);
 		return 2; // 2 = This ID is expired
@@ -439,10 +464,63 @@ int32 login_mmo_auth(struct login_session_data* sd, bool isServer) {
  * @param passwdenc: encode key of client
  * @param passwd: pass to check
  * @param refpass: pass register in db
+ * @param passwd_type: pass type in db
  * @return true if matching else false
  */
 bool login_check_password( struct login_session_data& sd, struct mmo_account& acc ){
+	// Stored form is argon2id: <passwordencrypt> cannot work against it, because
+	// verifying the challenge would require the cleartext password.
+	if( acc.passwd_type == PASSWD_TYPE_ARGON2 ){
+		if( sd.passwdenc != 0 ){
+			ShowWarning( "Account '%s' is stored as argon2id; <passwordencrypt> logins are not supported.\n", acc.userid );
+			return false;
+		}
+
+		if( !passwd_is_argon2( acc.pass ) ){
+			ShowError( "Account '%s' has passwd_type=%u but `user_pass` is not an argon2id hash; refusing the login.\n", acc.userid, acc.passwd_type );
+			ShowError( "To reset it: UPDATE `login` SET `user_pass`='<newpass>', `passwd_type`=0 WHERE `userid`='%s';\n", acc.userid );
+			return false;
+		}
+
+		return passwd_verify( sd.passwd, acc.pass );
+	}
+
+	if( acc.passwd_type == PASSWD_TYPE_ARGON2_MD5 ){
+		if( sd.passwdenc != 0 ){
+			ShowWarning( "Account '%s' is stored as argon2id(MD5); <passwordencrypt> logins are not supported.\n", acc.userid );
+			return false;
+		}
+
+		if( !passwd_is_argon2( acc.pass ) ){
+			ShowError( "Account '%s' has passwd_type=%u but `user_pass` is not an argon2id hash; refusing the login.\n", acc.userid, acc.passwd_type );
+			ShowError( "To reset it: UPDATE `login` SET `user_pass`='<newpass>', `passwd_type`=0 WHERE `userid`='%s';\n", acc.userid );
+			return false;
+		}
+
+		char md5pwd[PASSWD_LENGTH];
+
+		MD5_String( sd.passwd, md5pwd );
+
+		return passwd_verify( md5pwd, acc.pass );
+	}
+
 	if( sd.passwdenc == 0 ){
+		// legacy rows; rehashed on this login by login_update_password()
+
+		// passwd_type was lost or reset but the value is already a hash -
+		// comparing it as plaintext would always fail
+		if( passwd_is_argon2( acc.pass ) ){
+			return passwd_verify( sd.passwd, acc.pass );
+		}
+
+		if( passwd_is_md5( acc.pass ) ){
+			char md5pwd[PASSWD_LENGTH];
+
+			MD5_String( sd.passwd, md5pwd );
+
+			return 0 == strcmp( md5pwd, acc.pass );
+		}
+
 		return 0 == strcmp( sd.passwd, acc.pass );
 	}
 
@@ -479,6 +557,79 @@ bool login_check_password( struct login_session_data& sd, struct mmo_account& ac
 	}
 
 	return false;
+}
+
+/**
+ * Rehash a verified password into argon2id if it is not already stored that way.
+ * Assumes the password has already been validated as correct.
+ * @param passwd: cleartext password as supplied by the client
+ * @param acc: account to update
+ * @return 1 if updated, 0 if already current, -1 on error
+ */
+int32 login_update_password( const char* passwd, struct mmo_account* acc ){
+	if( acc->passwd_type == PASSWD_TYPE_ARGON2 ){
+		return 0; // already current
+	}
+
+	// The value is already an argon2id hash but passwd_type says otherwise - most
+	// likely a hand-edited row or a restored dump. Hashing it again would make
+	// the account permanently unusable, so repair the flag instead.
+	if( passwd_is_argon2( acc->pass ) ){
+		ShowWarning( "Account '%s' already stores an argon2id hash but had passwd_type=%u; correcting it.\n", acc->userid, acc->passwd_type );
+		acc->passwd_type = PASSWD_TYPE_ARGON2;
+		return 1;
+	}
+
+	bool was_md5 = passwd_is_md5( acc->pass );
+	std::string hashed = passwd_hash( passwd );
+
+	if( hashed.empty() ){
+		ShowError( "login_update_password: could not hash the password for '%s'.\n", acc->userid );
+		return -1;
+	}
+
+	safestrncpy( acc->pass, hashed.c_str(), sizeof( acc->pass ) );
+	acc->passwd_type = was_md5 ? PASSWD_TYPE_ARGON2_MD5 : PASSWD_TYPE_ARGON2;
+
+	ShowInfo( "Encrypted password for %s\n", acc->userid );
+
+	return 1;
+}
+
+/**
+ * Rehash every account, then shut down. Triggered by --encrypt-passwords.
+ */
+void login_update_all_passwords( void ){
+	AccountDBIterator* it = accounts->iterator( accounts );
+	struct mmo_account acc;
+	int32 counter = 0;
+
+	int32 failed = 0;
+
+	while( it->next( it, &acc ) ){
+		if( login_update_password( acc.pass, &acc ) != 1 ){
+			continue;
+		}
+
+		// a failed save must not be reported as a successful migration
+		if( !accounts->save( accounts, &acc, false ) ){
+			ShowError( "Failed to save the rehashed password for account '%s' (id %d).\n", acc.userid, acc.account_id );
+			failed++;
+			continue;
+		}
+
+		counter++;
+	}
+
+	it->destroy( it );
+
+	ShowInfo( "Encrypted %d passwords\n", counter );
+
+	if( failed > 0 ){
+		ShowError( "%d account(s) could not be saved and are still using the old format.\n", failed );
+	}
+
+	global_core->signal_shutdown();
 }
 
 int32 login_get_usercount( int32 users ){
@@ -859,6 +1010,19 @@ bool LoginServer::initialize( int32 argc, char* argv[] ){
 
 	// read login-server configuration
 	login_set_defaults();
+
+	// --encrypt-passwords: rehash every account to argon2id, then shut down.
+	// Handled here rather than in common/cli.cpp so that char-server and
+	// map-server do not need to link login-only symbols.
+	bool encrypt_all_passwords = false;
+
+	for( int32 i = 1; i < argc; i++ ){
+		if( argv[i] != nullptr && strcmp( argv[i], "--encrypt-passwords" ) == 0 ){
+			argv[i] = nullptr; // hide it from cli_get_options
+			encrypt_all_passwords = true;
+		}
+	}
+
 	cli_get_options(argc,argv);
 
 	login_config_read(LOGIN_CONF_NAME, true);
@@ -894,6 +1058,11 @@ bool LoginServer::initialize( int32 argc, char* argv[] ){
 			ShowFatalError("do_init: Failed to initialize account engine.\n");
 			return false;
 		}
+	}
+
+	if( encrypt_all_passwords ){
+		login_update_all_passwords();
+		return true; // signal_shutdown() was requested; do not open the port
 	}
 
 	// server port open & binding
