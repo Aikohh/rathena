@@ -1,0 +1,8 @@
+// Generated from conf/devenv/map_conf.txt during `devenv up`.
+// Runtime deployment values and interserver credentials.
+import: conf/import/deploy_conf.txt
+import: conf/import/secret_conf.txt
+
+// On the map server char_ip is the address used to dial the char server, not
+// the address advertised to players. Keep it on loopback after deploy_conf.
+char_ip: 127.0.0.1

@@ -1,0 +1,40 @@
+{
+  "appPort": [
+    "6900:6900",
+    "6121:6121",
+    "5121:5121"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "mkhl.direnv"
+      ]
+    },
+    "zed": {
+      "extensions": []
+    }
+  },
+  "forwardPorts": [
+    6900,
+    6121,
+    5121,
+    3306
+  ],
+  "image": "ghcr.io/cachix/devenv/devcontainer:latest",
+  "overrideCommand": false,
+  "portsAttributes": {
+    "3306": {
+      "label": "MariaDB"
+    },
+    "5121": {
+      "label": "rAthena map"
+    },
+    "6121": {
+      "label": "rAthena char"
+    },
+    "6900": {
+      "label": "rAthena login"
+    }
+  },
+  "updateContentCommand": "devenv test"
+}

@@ -1,0 +1,8 @@
+// Generated from conf/devenv/char_conf.txt during `devenv up`.
+// Runtime deployment values and interserver credentials.
+import: conf/import/deploy_conf.txt
+import: conf/import/secret_conf.txt
+
+// Server-to-server traffic stays on loopback. This must follow deploy_conf,
+// where char_ip means the public address advertised to game clients.
+login_ip: 127.0.0.1

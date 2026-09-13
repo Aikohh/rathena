@@ -1,0 +1,41 @@
+// Generated from conf/devenv/inter_conf.txt during `devenv up`.
+// Database connection glue; operator overrides remain in conf/import/inter_conf.txt.
+//
+// Only non-sensitive, non-volatile values belong here. The password and the
+// allocated port live in the two gitignored DEVENV_STATE files imported at
+// the bottom, each with a single owner:
+//   db_secret_conf.txt      tools/rathena-secrets.py
+//   inter_runtime_conf.txt  devenv, on every start
+//
+// rAthena resolves `import:` recursively in all three servers
+// (login.cpp:910, char/inter.cpp:863, map.cpp:4385), so the later file wins.
+
+login_server_ip: 127.0.0.1
+login_server_id: ragnarok
+login_server_db: ragnarok
+
+ipban_db_ip: 127.0.0.1
+ipban_db_id: ragnarok
+ipban_db_db: ragnarok
+
+char_server_ip: 127.0.0.1
+char_server_id: ragnarok
+char_server_db: ragnarok
+
+map_server_ip: 127.0.0.1
+map_server_id: ragnarok
+map_server_db: ragnarok
+
+web_server_ip: 127.0.0.1
+web_server_id: ragnarok
+web_server_db: ragnarok
+
+log_db_ip: 127.0.0.1
+log_db_id: ragnarok
+log_db_db: ragnarok
+
+// database password, written by tools/rathena-secrets.py
+import: @DEVENV_STATE@/db_secret_conf.txt
+
+// port devenv allocated for MariaDB, rewritten on every start
+import: @DEVENV_STATE@/inter_runtime_conf.txt

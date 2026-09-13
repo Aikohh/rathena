@@ -152,3 +152,26 @@ Thumbs.db
 
 # generated files
 generated
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+# server backups
+/backups/
+
+# local operator settings; .env.example is the tracked template
+.env
+.env.*
+!.env.example
+/secrets.age
+# Python bytecode
+__pycache__/
+*.py[cod]

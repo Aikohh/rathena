@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# rAthena server management. Run from anywhere inside the checkout:
+#
+#   ./rathena <command> [arguments]
+#   ./rathena help
+#
+# devenv tasks cannot take positional arguments - every extra token is read as
+# another task name - which forced things like RATHENA_ACCOUNT=player onto the
+# caller. This wrapper takes real arguments and sets those variables itself.
+#
+# It re-executes inside `devenv shell` when needed, so mariadb, age, secretspec
+# and python are on PATH without the caller arranging it.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$ROOT"
+
+die() { echo "rathena: $*" >&2; exit 1; }
+
+usage() {
+  cat >&2 <<'EOF'
+usage: ./rathena <command> [arguments]
+
+  build                          compile login/char/map/web
+  rebuild                        force a clean rebuild (after a PACKETVER change)
+  up                             start MariaDB and the servers (devenv up)
+
+  configure [--ip A] [--name N]  set the WAN address and server name
+  check                          pre-flight audit; non-zero exit on failures
+  gm <account> [--level N]       set an account's group (99 = Admin, 0 = Player)
+  sql ["QUERY"]                  SQL prompt on the ragnarok database
+  ban <ip|cidr> [--days N] [--reason TEXT]   block logins from an address
+  unban <ip|cidr>                lift a ban
+  bans [--purge]                 list active bans, or drop expired rows
+  ping [HOST]                    check reachability without a game client
+                                 defaults to the advertised char_ip
+                                 --local, --account U --password P
+
+  passwd <account>               set one account's password (prompts)
+  passwd <account> --enroll      let the owner choose it at their next login
+  passwd <account> --cancel-enroll   undo that
+  dev-accounts                   create player/player and gmadmin/gmadmin
+
+  secrets [--rotate NAME|all]    generate or rotate the generated secrets
+  peppers                        generate the operator peppers into secrets.age
+  identity [FILE]                install the age key (stdin if FILE is omitted)
+
+  backup                         take one backup now
+  restore [FILE] [--yes]         restore a backup; latest if FILE is omitted
+
+Settings live in .env - copy .env.example. Run './rathena help <command>'
+for the notes on a specific one.
+EOF
+  exit "${1:-1}"
+}
+
+# --- re-exec inside devenv when the toolchain is not already on PATH --------
+if [ -z "${DEVENV_ROOT:-}" ] && [ "${RATHENA_NO_REEXEC:-}" != "1" ]; then
+  command -v devenv >/dev/null 2>&1 || die "devenv not found on PATH"
+  exec devenv shell -- env RATHENA_NO_REEXEC=1 "$ROOT/rathena" "$@"
+fi
+
+[ $# -ge 1 ] || usage 1
+CMD=$1; shift
+
+case "$CMD" in
+  help|-h|--help) usage 0 ;;
+
+  build)        exec devenv tasks run rathena:build ;;
+  rebuild)      exec devenv tasks run rathena:rebuild ;;
+  up)           exec devenv up ;;
+  check)        exec devenv tasks run rathena:check ;;
+  ping)         exec python3 tools/rathena-ping.py "$@" ;;
+  backup)       exec bash tools/rathena-backup.sh ;;
+  dev-accounts) exec devenv tasks run rathena:dev-accounts ;;
+  peppers)      exec bash tools/rathena-peppers.sh ;;
+  gm)           exec bash tools/rathena-gm.sh "$@" ;;
+  sql)          exec bash tools/rathena-sql.sh "$@" ;;
+  ban)          exec bash tools/rathena-ban.sh add "$@" ;;
+  unban)        exec bash tools/rathena-ban.sh remove "$@" ;;
+  bans)
+    case "${1:-}" in
+      --purge) exec bash tools/rathena-ban.sh purge ;;
+      "")      exec bash tools/rathena-ban.sh list ;;
+      *)       die "unknown option for bans: $1" ;;
+    esac
+    ;;
+
+  configure)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --ip)     RATHENA_PUBLIC_IP=${2:-}   || true; shift 2 ;;
+        --name)   RATHENA_SERVER_NAME=${2:-} || true; shift 2 ;;
+        --subnet) RATHENA_LAN_SUBNET=${2:-}  || true; shift 2 ;;
+        -h|--help) echo "usage: ./rathena configure [--ip <wan ip|auto>] [--name <server name>] [--subnet <a.b.c.0/24>]" >&2; exit 0 ;;
+        *) die "configure: unknown argument '$1'" ;;
+      esac
+    done
+    export RATHENA_PUBLIC_IP RATHENA_SERVER_NAME RATHENA_LAN_SUBNET 2>/dev/null || true
+    exec python3 tools/rathena-configure.py
+    ;;
+
+  passwd)
+    [ $# -ge 1 ] || die "usage: ./rathena passwd <account> [--enroll|--cancel-enroll]"
+    account=$1; shift
+    case "${1:-}" in
+      --enroll)        exec ./login-server --enroll-password "$account" ;;
+      --cancel-enroll) exec ./login-server --cancel-enroll "$account" ;;
+      "")              exec ./login-server --set-password "$account" ;;
+      *)               die "unknown option for passwd: $1" ;;
+    esac
+    ;;
+
+  secrets)
+    case "${1:-}" in
+      "")        exec python3 tools/rathena-secrets.py ;;
+      --rotate)
+        shift
+        if [ "${1:-}" = "all" ] || [ $# -eq 0 ]; then
+          exec python3 tools/rathena-secrets.py --rotate
+        fi
+        exec python3 tools/rathena-secrets.py --rotate "$@"
+        ;;
+      -h|--help) echo "usage: ./rathena secrets [--rotate inter_user|inter_pass|db_pass|all]" >&2; exit 0 ;;
+      *) die "secrets: unknown argument '$1'" ;;
+    esac
+    ;;
+
+  identity)
+    if [ $# -ge 1 ]; then
+      [ -f "$1" ] || die "no such file: $1"
+      exec bash tools/rathena-identity.sh < "$1"
+    fi
+    exec bash tools/rathena-identity.sh
+    ;;
+
+  restore)
+    FILE=""
+    CONFIRM=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --yes|-y) CONFIRM=yes; shift ;;
+        -h|--help) echo "usage: ./rathena restore [FILE] [--yes]" >&2; exit 0 ;;
+        -*) die "restore: unknown argument '$1'" ;;
+        *) FILE=$1; shift ;;
+      esac
+    done
+    [ -z "$FILE" ] || export RATHENA_RESTORE="$FILE"
+    [ -z "$CONFIRM" ] || export RATHENA_RESTORE_CONFIRM=yes
+    exec bash tools/rathena-restore.sh
+    ;;
+
+  *) die "unknown command '$CMD' (try './rathena help')" ;;
+esac
