@@ -27,12 +27,24 @@ enum e_passwd_type : uint8 {
 	/// A flag rather than a fourth value, so it composes with all three forms
 	/// and rows written with and without a pepper can coexist.
 	PASSWD_FLAG_PEPPERED = 0x10,
+
+	/// The next login SETS this account's password instead of checking it.
+	/// For a player who has forgotten theirs: the operator raises the flag,
+	/// the player types the password they want, and it is stored and the flag
+	/// cleared in the same step. The operator never learns the password and
+	/// there is no temporary one to leak or forget to change.
+	///
+	/// While it is raised the account has no password, so anyone who knows the
+	/// name can claim it. Raise it when the player is ready, not in advance.
+	PASSWD_FLAG_ENROLL = 0x20,
 };
 
 /// The storage form, with the pepper flag masked off.
 #define PASSWD_TYPE_BASE(t) ((t) & 0x0F)
 /// Was this row written with the server-side hash pepper applied?
 #define PASSWD_IS_PEPPERED(t) (((t) & PASSWD_FLAG_PEPPERED) != 0)
+/// Is this account waiting for its owner to choose a password?
+#define PASSWD_IS_ENROLLING(t) (((t) & PASSWD_FLAG_ENROLL) != 0)
 
 struct mmo_account {
 	uint32 account_id;

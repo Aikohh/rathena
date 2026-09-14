@@ -63,6 +63,7 @@ int32 login_fd; // login server file descriptor socket
 
 //early declaration
 bool login_check_password( struct login_session_data& sd, struct mmo_account& acc );
+static bool login_enroll_password( struct login_session_data& sd, struct mmo_account& acc, const char* ip );
 int32 login_update_password( const char* passwd, struct mmo_account* acc );
 
 ///Accessors
@@ -329,6 +330,15 @@ int32 login_mmo_auth(struct login_session_data* sd, bool isServer) {
 	char ip[16];
 	ip2str(session[sd->fd]->client_addr, ip);
 
+	// A configured fixed challenge is an explicit server-wide requirement for
+	// <passwordencrypt>. Enforce it before account lookup and registration so
+	// legacy rows and the launcher's pseudo-SSO packet cannot bypass the policy.
+	// Char-server authentication uses the server protocol and is exempt.
+	if( !isServer && login_config.password_pepper[0] != '\0' && sd->passwdenc == 0 ){
+		ShowWarning( "Cleartext login refused for '%s': password_pepper requires <passwordencrypt>.\n", sd->userid );
+		return 3; // rejected from server
+	}
+
 	// DNS Blacklist check
 	if( login_config.use_dnsbl ) {
 		char r_ip[16];
@@ -382,6 +392,18 @@ int32 login_mmo_auth(struct login_session_data* sd, bool isServer) {
 	if( !isServer && sex_str2num( acc.sex ) == SEX_SERVER ){
 		ShowWarning( "Connection refused: ip %s tried to log into server account '%s'\n", ip, sd->userid );
 		return 0; // 0 = Unregistered ID
+	}
+
+	// Password enrollment: the operator flagged this account, so whatever the
+	// owner types now BECOMES the password rather than being checked against
+	// the old one. Deliberately before login_check_password, since the point is
+	// that nobody knows the current value.
+	if( PASSWD_IS_ENROLLING( acc.passwd_type ) ){
+		if( !login_enroll_password( *sd, acc, ip ) ){
+			return 1; // 1 = Incorrect Password
+		}
+
+		return -1; // -1 = success, same as a normal login below
 	}
 
 	if( !login_check_password( *sd, acc ) ) {
@@ -653,6 +675,64 @@ int32 login_update_password( const char* passwd, struct mmo_account* acc ){
 }
 
 /**
+ * Store the password the client just sent, for an account the operator flagged
+ * with PASSWD_FLAG_ENROLL, and clear the flag.
+ *
+ * @param sd: session, holding what the client sent
+ * @param acc: account to write, already loaded
+ * @param ip: client address, for the log
+ * @return false if it could not be stored; the login must then be refused
+ */
+static bool login_enroll_password( struct login_session_data& sd, struct mmo_account& acc, const char* ip ){
+	// Under <passwordencrypt> the client sends MD5(md5key + password). With a
+	// fixed password_pepper that value is stable and can be stored, but with
+	// the default random nonce it changes every session, so storing it would
+	// lock the account out permanently.
+	if( sd.passwdenc != 0 && login_config.password_pepper[0] == '\0' ){
+		ShowError( "Cannot enroll a password for '%s': the client uses <passwordencrypt> and password_pepper is not set.\n", acc.userid );
+		ShowError( "Set the password directly instead: ./rathena passwd %s\n", acc.userid );
+		return false;
+	}
+
+	if( sd.passwd[0] == '\0' ){
+		ShowNotice( "Password enrollment for '%s' rejected: empty password (ip: %s)\n", acc.userid, ip );
+		return false;
+	}
+
+	// An encrypted client sends a fixed-length MD5 digest, so the server cannot
+	// infer the original password length. Cleartext enrollment can still enforce
+	// the configured minimum; encrypted clients must enforce it client-side.
+	if( sd.passwdenc == 0 && strlen( sd.passwd ) < login_config.password_min_length ){
+		ShowNotice( "Password enrollment for '%s' rejected: shorter than password_min_length (%d) (ip: %s)\n",
+			acc.userid, login_config.password_min_length, ip );
+		return false;
+	}
+
+	std::string hashed = passwd_hash( sd.passwd );
+
+	if( hashed.empty() ){
+		ShowError( "Password enrollment for '%s' failed: could not hash the password.\n", acc.userid );
+		return false;
+	}
+
+	safestrncpy( acc.pass, hashed.c_str(), sizeof( acc.pass ) );
+	// The stored form depends on what the client sent, exactly as --set-password
+	// decides it: a peppered wire value is argon2id(MD5(pepper+password)).
+	acc.passwd_type = ( sd.passwdenc != 0 ? PASSWD_TYPE_ARGON2_PEPPER : PASSWD_TYPE_ARGON2 )
+		| ( passwd_peppered() ? PASSWD_FLAG_PEPPERED : 0 );
+	// flag cleared by the assignment above; enrollment is single-use
+
+	if( !accounts->save( accounts, &acc, false ) ){
+		ShowError( "Password enrollment for '%s' failed: could not save the account.\n", acc.userid );
+		return false;
+	}
+
+	ShowNotice( "Password enrolled for '%s' by its owner (ip: %s)\n", acc.userid, ip );
+
+	return true;
+}
+
+/**
  * Read a password from stdin without echoing it.
  * @return false if nothing could be read
  */
@@ -698,22 +778,86 @@ static bool login_read_password( const char* prompt, char* out, size_t out_size 
  *
  * Writes the final argon2id hash directly, so unlike an SQL UPDATE there is
  * no window where the cleartext sits in the row waiting to be rehashed.
+ *
+ * Exits non-zero on every failure. signal_shutdown() alone would return 0 and
+ * a caller could not tell "password changed" from "no such account".
  */
+/**
+ * Flag an account so its owner sets the password on the next login, then shut
+ * down. Triggered by --enroll-password.
+ *
+ * Exits non-zero on failure, like --set-password.
+ */
+static void login_enroll_account( const char* userid ){
+	struct mmo_account acc;
+
+	if( !accounts->load_str( accounts, &acc, userid ) ){
+		ShowError( "No such account: '%s'\n", userid );
+		exit( EXIT_FAILURE );
+	}
+
+	if( PASSWD_IS_ENROLLING( acc.passwd_type ) ){
+		ShowStatus( "Account '%s' is already waiting for a new password.\n", acc.userid );
+		global_core->signal_shutdown();
+		return;
+	}
+
+	acc.passwd_type |= PASSWD_FLAG_ENROLL;
+
+	if( !accounts->save( accounts, &acc, false ) ){
+		ShowError( "Failed to save the account.\n" );
+		exit( EXIT_FAILURE );
+	}
+
+	ShowStatus( "Account '%s' will take a new password at its next login.\n", acc.userid );
+	ShowWarning( "Until then anyone who knows the name can claim it. Cancel with:\n" );
+	ShowWarning( "  ./rathena passwd %s --cancel-enroll\n", acc.userid );
+
+	global_core->signal_shutdown();
+}
+
+/**
+ * Clear PASSWD_FLAG_ENROLL, leaving the stored password as it was.
+ */
+static void login_cancel_enroll( const char* userid ){
+	struct mmo_account acc;
+
+	if( !accounts->load_str( accounts, &acc, userid ) ){
+		ShowError( "No such account: '%s'\n", userid );
+		exit( EXIT_FAILURE );
+	}
+
+	if( !PASSWD_IS_ENROLLING( acc.passwd_type ) ){
+		ShowStatus( "Account '%s' was not waiting for a new password.\n", acc.userid );
+		global_core->signal_shutdown();
+		return;
+	}
+
+	acc.passwd_type &= ~PASSWD_FLAG_ENROLL;
+
+	if( !accounts->save( accounts, &acc, false ) ){
+		ShowError( "Failed to save the account.\n" );
+		exit( EXIT_FAILURE );
+	}
+
+	ShowStatus( "Password enrollment cancelled for '%s'; the old password still applies.\n", acc.userid );
+
+	global_core->signal_shutdown();
+}
+
 static void login_set_password( const char* userid ){
 	struct mmo_account acc;
 
 	if( !accounts->load_str( accounts, &acc, userid ) ){
 		ShowError( "No such account: '%s'\n", userid );
-		global_core->signal_shutdown();
-		return;
+		exit( EXIT_FAILURE ); // non-zero so ./rathena passwd can tell
 	}
 
 	char first[PASSWD_LENGTH];
 
 	if( !login_read_password( "New password: ", first, sizeof( first ) ) || first[0] == '\0' ){
 		ShowError( "No password given.\n" );
-		global_core->signal_shutdown();
-		return;
+		exit( EXIT_FAILURE ); // non-zero so ./rathena passwd can tell
 	}
 
 	if( isatty( STDIN_FILENO ) ){
@@ -721,15 +865,13 @@ static void login_set_password( const char* userid ){
 
 		if( !login_read_password( "Repeat: ", again, sizeof( again ) ) || strcmp( first, again ) != 0 ){
 			ShowError( "Passwords do not match.\n" );
-			global_core->signal_shutdown();
-			return;
+			exit( EXIT_FAILURE );
 		}
 	}
 
 	if( strlen( first ) < login_config.password_min_length ){
 		ShowError( "Password is shorter than password_min_length (%d).\n", login_config.password_min_length );
-		global_core->signal_shutdown();
-		return;
+		exit( EXIT_FAILURE ); // non-zero so ./rathena passwd can tell
 	}
 
 	// In pepper mode the client sends MD5(pepper + password), so that is what
@@ -750,8 +892,7 @@ static void login_set_password( const char* userid ){
 
 	if( hashed.empty() ){
 		ShowError( "Could not hash the password.\n" );
-		global_core->signal_shutdown();
-		return;
+		exit( EXIT_FAILURE ); // non-zero so ./rathena passwd can tell
 	}
 
 	safestrncpy( acc.pass, hashed.c_str(), sizeof( acc.pass ) );
@@ -760,8 +901,7 @@ static void login_set_password( const char* userid ){
 
 	if( !accounts->save( accounts, &acc, false ) ){
 		ShowError( "Failed to save the account.\n" );
-		global_core->signal_shutdown();
-		return;
+		exit( EXIT_FAILURE ); // non-zero so ./rathena passwd can tell
 	}
 
 	ShowStatus( "Password updated for '%s' (argon2id%s).\n", acc.userid, use_pepper ? ", peppered" : "" );
@@ -1204,6 +1344,8 @@ bool LoginServer::initialize( int32 argc, char* argv[] ){
 	// map-server do not need to link login-only symbols.
 	bool encrypt_all_passwords = false;
 	const char* set_password_for = nullptr;
+	const char* enroll_password_for = nullptr;
+	const char* cancel_enroll_for = nullptr;
 
 	for( int32 i = 1; i < argc; i++ ){
 		if( argv[i] == nullptr ){
@@ -1220,6 +1362,24 @@ bool LoginServer::initialize( int32 argc, char* argv[] ){
 			}
 
 			set_password_for = argv[i + 1];
+			argv[i] = nullptr;
+			argv[i + 1] = nullptr;
+		}else if( strcmp( argv[i], "--enroll-password" ) == 0 ){
+			if( i + 1 >= argc || argv[i + 1] == nullptr ){
+				ShowFatalError( "--enroll-password requires an account name.\n" );
+				return false;
+			}
+
+			enroll_password_for = argv[i + 1];
+			argv[i] = nullptr;
+			argv[i + 1] = nullptr;
+		}else if( strcmp( argv[i], "--cancel-enroll" ) == 0 ){
+			if( i + 1 >= argc || argv[i + 1] == nullptr ){
+				ShowFatalError( "--cancel-enroll requires an account name.\n" );
+				return false;
+			}
+
+			cancel_enroll_for = argv[i + 1];
 			argv[i] = nullptr;
 			argv[i + 1] = nullptr;
 		}
@@ -1279,6 +1439,16 @@ bool LoginServer::initialize( int32 argc, char* argv[] ){
 
 	if( set_password_for != nullptr ){
 		login_set_password( set_password_for );
+		return true;
+	}
+
+	if( enroll_password_for != nullptr ){
+		login_enroll_account( enroll_password_for );
+		return true;
+	}
+
+	if( cancel_enroll_for != nullptr ){
+		login_cancel_enroll( cancel_enroll_for );
 		return true;
 	}
 
