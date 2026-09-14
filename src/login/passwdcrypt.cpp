@@ -7,6 +7,8 @@
 #include <cstring>
 
 #include <argon2.h>
+#include <openssl/hmac.h>
+#include <string>
 
 #include <common/cbasetypes.hpp>
 #include <common/mmo.hpp>
@@ -103,19 +105,67 @@ static bool passwd_random_bytes( unsigned char* out, size_t len ){
 #endif
 }
 
+static std::string passwd_pepper_value;
+
+void passwd_set_pepper( const char* pepper ){
+	passwd_pepper_value = ( pepper != nullptr ) ? pepper : "";
+}
+
+bool passwd_peppered( void ){
+	return !passwd_pepper_value.empty();
+}
+
+/**
+ * Apply the pepper, if one is set. HMAC rather than concatenation: it is the
+ * construction designed for a secret key, and it sidesteps length-extension
+ * and ambiguous-boundary issues entirely.
+ *
+ * The result is hex so it stays a printable C string for argon2.
+ */
+static std::string passwd_apply_pepper( const char* plain ){
+	if( passwd_pepper_value.empty() ){
+		return std::string( plain );
+	}
+
+	unsigned char mac[EVP_MAX_MD_SIZE];
+	unsigned int mac_len = 0;
+
+	HMAC( EVP_sha256(),
+		passwd_pepper_value.data(), (int32)passwd_pepper_value.size(),
+		(const unsigned char*)plain, strlen( plain ),
+		mac, &mac_len );
+
+	static const char hex[] = "0123456789abcdef";
+	std::string out;
+
+	out.reserve( mac_len * 2 );
+
+	for( unsigned int i = 0; i < mac_len; i++ ){
+		out.push_back( hex[mac[i] >> 4] );
+		out.push_back( hex[mac[i] & 0x0F] );
+	}
+
+	return out;
+}
+
 std::string passwd_hash( const char* plain ){
 	if( plain == nullptr ){
 		return std::string();
 	}
 
-	size_t plain_len = strlen( plain );
-
 	// Bound the input even though callers pass a PASSWD_LENGTH buffer: this is
 	// the single entry point for hashing and must not trust its caller.
-	if( plain_len >= PASSWD_LENGTH ){
-		ShowError( "passwd_hash: password too long (%zu >= %d).\n", plain_len, PASSWD_LENGTH );
+	if( strlen( plain ) >= PASSWD_LENGTH ){
+		ShowError( "passwd_hash: password too long (%zu >= %d).\n", strlen( plain ), PASSWD_LENGTH );
 		return std::string();
 	}
+
+	// after this point `plain` may be the 64-character HMAC, not the password
+	std::string peppered = passwd_apply_pepper( plain );
+
+	plain = peppered.c_str();
+
+	size_t plain_len = peppered.size();
 
 	unsigned char salt[PASSWD_ARGON2_SALT];
 
@@ -142,14 +192,24 @@ std::string passwd_hash( const char* plain ){
 	return std::string( encoded );
 }
 
-bool passwd_verify( const char* plain, const char* encoded ){
+static bool passwd_verify_with( const char* plain, const char* encoded, bool peppered ){
 	if( plain == nullptr || encoded == nullptr || *encoded == '\0' ){
 		return false;
 	}
 
+	std::string input = peppered ? passwd_apply_pepper( plain ) : std::string( plain );
+
 	// argon2id_verify returns ARGON2_OK only on a match; every other code,
 	// including a malformed hash, is a failure.
-	return argon2id_verify( encoded, plain, strlen( plain ) ) == ARGON2_OK;
+	return argon2id_verify( encoded, input.c_str(), input.size() ) == ARGON2_OK;
+}
+
+bool passwd_verify( const char* plain, const char* encoded ){
+	return passwd_verify_with( plain, encoded, passwd_peppered() );
+}
+
+bool passwd_verify_raw( const char* plain, const char* encoded ){
+	return passwd_verify_with( plain, encoded, false );
 }
 
 bool passwd_is_argon2( const char* stored ){

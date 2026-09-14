@@ -289,7 +289,8 @@ int32 login_mmo_auth_new(const char* userid, const char* pass, const char sex, c
 	safestrncpy(acc.pincode, "", sizeof(acc.pincode));
 	acc.pincode_change = 0;
 	acc.char_slots = MIN_CHARS;
-	acc.passwd_type = peppered ? PASSWD_TYPE_ARGON2_PEPPER : PASSWD_TYPE_ARGON2;
+	acc.passwd_type = ( peppered ? PASSWD_TYPE_ARGON2_PEPPER : PASSWD_TYPE_ARGON2 )
+		| ( passwd_peppered() ? PASSWD_FLAG_PEPPERED : 0 );
 #ifdef VIP_ENABLE
 	acc.vip_time = 0;
 	acc.old_group = 0;
@@ -486,7 +487,7 @@ bool login_check_password( struct login_session_data& sd, struct mmo_account& ac
 	// Peppered accounts: the client already hashed the password with the fixed
 	// key, so sd.passwd IS the credential. It is deterministic, which is what
 	// makes argon2id possible here - and also what makes it replayable.
-	if( acc.passwd_type == PASSWD_TYPE_ARGON2_PEPPER ){
+	if( PASSWD_TYPE_BASE( acc.passwd_type ) == PASSWD_TYPE_ARGON2_PEPPER ){
 		if( login_config.password_pepper[0] == '\0' ){
 			ShowError( "Account '%s' is peppered but password_pepper is not configured; refusing the login.\n", acc.userid );
 			return false;
@@ -503,12 +504,14 @@ bool login_check_password( struct login_session_data& sd, struct mmo_account& ac
 			return false;
 		}
 
-		return passwd_verify( sd.passwd, acc.pass );
+		return PASSWD_IS_PEPPERED( acc.passwd_type )
+			? passwd_verify( sd.passwd, acc.pass )
+			: passwd_verify_raw( sd.passwd, acc.pass );
 	}
 
 	// Stored form is argon2id: <passwordencrypt> cannot work against it, because
 	// verifying the challenge would require the cleartext password.
-	if( acc.passwd_type == PASSWD_TYPE_ARGON2 ){
+	if( PASSWD_TYPE_BASE( acc.passwd_type ) == PASSWD_TYPE_ARGON2 ){
 		if( sd.passwdenc != 0 ){
 			ShowWarning( "Account '%s' is stored as argon2id; <passwordencrypt> logins are not supported.\n", acc.userid );
 			return false;
@@ -520,10 +523,12 @@ bool login_check_password( struct login_session_data& sd, struct mmo_account& ac
 			return false;
 		}
 
-		return passwd_verify( sd.passwd, acc.pass );
+		return PASSWD_IS_PEPPERED( acc.passwd_type )
+			? passwd_verify( sd.passwd, acc.pass )
+			: passwd_verify_raw( sd.passwd, acc.pass );
 	}
 
-	if( acc.passwd_type == PASSWD_TYPE_ARGON2_MD5 ){
+	if( PASSWD_TYPE_BASE( acc.passwd_type ) == PASSWD_TYPE_ARGON2_MD5 ){
 		if( sd.passwdenc != 0 ){
 			ShowWarning( "Account '%s' is stored as argon2id(MD5); <passwordencrypt> logins are not supported.\n", acc.userid );
 			return false;
@@ -539,7 +544,9 @@ bool login_check_password( struct login_session_data& sd, struct mmo_account& ac
 
 		MD5_String( sd.passwd, md5pwd );
 
-		return passwd_verify( md5pwd, acc.pass );
+		return PASSWD_IS_PEPPERED( acc.passwd_type )
+			? passwd_verify( md5pwd, acc.pass )
+			: passwd_verify_raw( md5pwd, acc.pass );
 	}
 
 	if( sd.passwdenc == 0 ){
@@ -548,7 +555,9 @@ bool login_check_password( struct login_session_data& sd, struct mmo_account& ac
 		// passwd_type was lost or reset but the value is already a hash -
 		// comparing it as plaintext would always fail
 		if( passwd_is_argon2( acc.pass ) ){
-			return passwd_verify( sd.passwd, acc.pass );
+			return PASSWD_IS_PEPPERED( acc.passwd_type )
+			? passwd_verify( sd.passwd, acc.pass )
+			: passwd_verify_raw( sd.passwd, acc.pass );
 		}
 
 		if( passwd_is_md5( acc.pass ) ){
@@ -605,16 +614,24 @@ bool login_check_password( struct login_session_data& sd, struct mmo_account& ac
  * @return 1 if updated, 0 if already current, -1 on error
  */
 int32 login_update_password( const char* passwd, struct mmo_account* acc ){
-	if( acc->passwd_type == PASSWD_TYPE_ARGON2 || acc->passwd_type == PASSWD_TYPE_ARGON2_PEPPER ){
+	// Current means: argon2id in the expected form AND the pepper state of the
+	// row matching the server's configuration. Enabling a pepper therefore
+	// re-hashes each account on its next login, at no cost to the operator.
+	uint8 base = PASSWD_TYPE_BASE( acc->passwd_type );
+
+	if( ( base == PASSWD_TYPE_ARGON2 || base == PASSWD_TYPE_ARGON2_PEPPER )
+		&& PASSWD_IS_PEPPERED( acc->passwd_type ) == passwd_peppered() ){
 		return 0; // already current
 	}
 
 	// The value is already an argon2id hash but passwd_type says otherwise - most
 	// likely a hand-edited row or a restored dump. Hashing it again would make
 	// the account permanently unusable, so repair the flag instead.
-	if( passwd_is_argon2( acc->pass ) ){
+	if( passwd_is_argon2( acc->pass ) && PASSWD_TYPE_BASE( acc->passwd_type ) == 0 ){
 		ShowWarning( "Account '%s' already stores an argon2id hash but had passwd_type=%u; correcting it.\n", acc->userid, acc->passwd_type );
-		acc->passwd_type = PASSWD_TYPE_ARGON2;
+		// the pepper state of an unknown row cannot be inferred; assume the
+		// server's current setting, which is right for a row it wrote itself
+		acc->passwd_type = PASSWD_TYPE_ARGON2 | ( passwd_peppered() ? PASSWD_FLAG_PEPPERED : 0 );
 		return 1;
 	}
 
@@ -627,7 +644,8 @@ int32 login_update_password( const char* passwd, struct mmo_account* acc ){
 	}
 
 	safestrncpy( acc->pass, hashed.c_str(), sizeof( acc->pass ) );
-	acc->passwd_type = was_md5 ? PASSWD_TYPE_ARGON2_MD5 : PASSWD_TYPE_ARGON2;
+	acc->passwd_type = ( was_md5 ? PASSWD_TYPE_ARGON2_MD5 : PASSWD_TYPE_ARGON2 )
+		| ( passwd_peppered() ? PASSWD_FLAG_PEPPERED : 0 );
 
 	ShowInfo( "Encrypted password for %s\n", acc->userid );
 
@@ -737,7 +755,8 @@ static void login_set_password( const char* userid ){
 	}
 
 	safestrncpy( acc.pass, hashed.c_str(), sizeof( acc.pass ) );
-	acc.passwd_type = use_pepper ? PASSWD_TYPE_ARGON2_PEPPER : PASSWD_TYPE_ARGON2;
+	acc.passwd_type = ( use_pepper ? PASSWD_TYPE_ARGON2_PEPPER : PASSWD_TYPE_ARGON2 )
+		| ( passwd_peppered() ? PASSWD_FLAG_PEPPERED : 0 );
 
 	if( !accounts->save( accounts, &acc, false ) ){
 		ShowError( "Failed to save the account.\n" );
@@ -949,8 +968,19 @@ bool login_config_read(const char* cfgName, bool normal) {
 			login_config.start_limited_time = atoi(w2);
 		else if(!strcmpi(w1, "use_MD5_passwords"))
 			login_config.use_md5_passwds = (bool)config_switch(w2);
-		else if(!strcmpi(w1, "password_pepper"))
+		else if(!strcmpi(w1, "password_pepper")){
 			safestrncpy(login_config.password_pepper, w2, sizeof(login_config.password_pepper));
+
+			// Only the first 20 bytes ever reach the client: that is the size of
+			// login_session_data::md5key, which is what AC_ACK_HASH carries.
+			// Silently ignoring the rest would make edits past that point
+			// look effective while changing nothing.
+			if( strlen(login_config.password_pepper) > 20 ){
+				ShowWarning("password_pepper is %zu characters; only the first 20 are sent to the client.\n", strlen(login_config.password_pepper));
+			}
+		}
+		else if(!strcmpi(w1, "password_hash_pepper"))
+			safestrncpy(login_config.password_hash_pepper, w2, sizeof(login_config.password_hash_pepper));
 		else if(!strcmpi(w1, "group_id_to_connect"))
 			login_config.group_id_to_connect = atoi(w2);
 		else if(!strcmpi(w1, "min_group_id_to_connect"))
@@ -1072,6 +1102,7 @@ void login_set_defaults() {
 #endif
 	login_config.use_md5_passwds = false;
 	login_config.password_pepper[0] = '\0';
+	login_config.password_hash_pepper[0] = '\0';
 	login_config.group_id_to_connect = -1;
 	login_config.min_group_id_to_connect = -1;
 
@@ -1197,6 +1228,14 @@ bool LoginServer::initialize( int32 argc, char* argv[] ){
 	cli_get_options(argc,argv);
 
 	login_config_read(LOGIN_CONF_NAME, true);
+
+	// must happen before any password is hashed or verified
+	passwd_set_pepper( login_config.password_hash_pepper );
+
+	if( passwd_peppered() ){
+		ShowStatus( "Password hash pepper: " CL_GREEN "enabled" CL_RESET ".\n" );
+		ShowWarning( "Losing it means every account has to be reset - keep a copy outside the database backup.\n" );
+	}
 	msg_config_read(LOGIN_MSG_CONF_NAME);
 	login_lan_config_read(LAN_CONF_NAME);
 	//end config

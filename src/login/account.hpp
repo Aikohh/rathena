@@ -21,7 +21,18 @@ enum e_passwd_type : uint8 {
 	PASSWD_TYPE_ARGON2 = 1,       ///< argon2id( password )
 	PASSWD_TYPE_ARGON2_MD5 = 2,   ///< argon2id( MD5( password ) ), migrated MD5 rows
 	PASSWD_TYPE_ARGON2_PEPPER = 3,///< argon2id( MD5( pepper + password ) ), see password_pepper
+
+	/// OR-ed into the type above when password_hash_pepper was set at the time
+	/// the row was written: the input was HMAC-SHA256(pepper, input) first.
+	/// A flag rather than a fourth value, so it composes with all three forms
+	/// and rows written with and without a pepper can coexist.
+	PASSWD_FLAG_PEPPERED = 0x10,
 };
+
+/// The storage form, with the pepper flag masked off.
+#define PASSWD_TYPE_BASE(t) ((t) & 0x0F)
+/// Was this row written with the server-side hash pepper applied?
+#define PASSWD_IS_PEPPERED(t) (((t) & PASSWD_FLAG_PEPPERED) != 0)
 
 struct mmo_account {
 	uint32 account_id;

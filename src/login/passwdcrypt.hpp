@@ -33,6 +33,22 @@
 /// Longest stored form. Keep `login`.`user_pass` at least this wide.
 #define PASSWD_ARGON2_ENCODED 98
 
+/**
+ * Set the server-side hash pepper. Empty disables it.
+ *
+ * A pepper is a secret the server holds and the database does not. With one
+ * configured the stored form becomes argon2id( HMAC-SHA256( pepper, password ) ),
+ * so an attacker holding only a database dump cannot test any candidate at
+ * all - not slowly, not expensively. It is the one thing that protects a weak
+ * password against a leaked backup.
+ *
+ * It is NOT rotatable: changing it invalidates every account.
+ */
+void passwd_set_pepper( const char* pepper );
+
+/// True when a hash pepper is configured.
+bool passwd_peppered( void );
+
 /// Prefix every Argon2id hash carries.
 #define PASSWD_ARGON2_PREFIX "$argon2id$"
 
@@ -41,6 +57,9 @@
  * @return the PHC string, or an empty string on failure (never throws).
  */
 std::string passwd_hash( const char* plain );
+
+/// Verify against a row that was written WITHOUT the pepper.
+bool passwd_verify_raw( const char* plain, const char* encoded );
 
 /**
  * Verify a cleartext password against a stored PHC string.

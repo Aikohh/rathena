@@ -13,6 +13,10 @@ LIBCONFIG_INCLUDE = -I../../3rdparty/libconfig
 ARGON2_LIBS = $(shell pkg-config --libs libargon2 2>/dev/null || echo -largon2)
 ARGON2_INCLUDE = $(shell pkg-config --cflags libargon2 2>/dev/null)
 
+# HMAC-SHA256 for the optional server-side hash pepper
+CRYPTO_LIBS = $(shell pkg-config --libs libcrypto 2>/dev/null || echo -lcrypto)
+CRYPTO_INCLUDE = $(shell pkg-config --cflags libcrypto 2>/dev/null)
+
 
 LOGIN_OBJ = $(shell ls *.cpp | sed -e "s/\.cpp/\.o/g")
 LOGIN_DIR_OBJ = $(LOGIN_OBJ:%=obj/%)
@@ -68,7 +72,7 @@ obj:
 
 login-server: obj $(LOGIN_DIR_OBJ) $(COMMON_AR) $(RAPIDYAML_AR)
 	@echo "	LD	@OLOG@@EXEEXT@"
-	@@CXX@ @LDFLAGS@ -o ../../@OLOG@@EXEEXT@ $(LOGIN_DIR_OBJ) $(COMMON_AR) $(LIBCONFIG_AR) $(RAPIDYAML_AR) @LIBS@ @MYSQL_LIBS@ $(ARGON2_LIBS)
+	@@CXX@ @LDFLAGS@ -o ../../@OLOG@@EXEEXT@ $(LOGIN_DIR_OBJ) $(COMMON_AR) $(LIBCONFIG_AR) $(RAPIDYAML_AR) @LIBS@ @MYSQL_LIBS@ $(ARGON2_LIBS) $(CRYPTO_LIBS)
 
 # login object files
 

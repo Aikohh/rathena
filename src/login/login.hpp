@@ -92,6 +92,7 @@ struct Login_Config {
 	int32 start_limited_time;                         /// new account expiration time (-1: unlimited)
 	bool use_md5_passwds;                           /// work with password hashes instead of plaintext passwords?
 	char password_pepper[32];                       /// fixed <passwordencrypt> key; empty disables it (see conf/login_athena.conf)
+	char password_hash_pepper[128];                 /// server-side secret mixed into every password hash; empty disables it
 	int32 group_id_to_connect;                        /// required group id to connect
 	int32 min_group_id_to_connect;                    /// minimum group id to connect
 
